@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+google-genai
+python-dotenv
+chromadb
+sentence-transformers
+kaggle
+pandas
+langgraph>=0.2.0
+langchain-core>=0.3.0

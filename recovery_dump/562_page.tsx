@@ -1,0 +1,2 @@
+    <main className="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased selection:bg-cyan-500 selection:text-black">
+      <div className="max-w-6xl w-full mx-auto mt-16 md:mt-24 mb-16 px-6 mr-12 md:mr-32 space-y-12">
