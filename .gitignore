@@ -25,3 +25,9 @@ yarn-debug.log*
 .DS_Store
 Thumbs.db
 .snapshots/
+
+# Environment Variables & Secrets
+.env
+.env.*
+backend/.env
+frontend/.env.local

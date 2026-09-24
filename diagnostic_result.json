@@ -1,0 +1,10 @@
+{
+  "equipment_id": "HYD-PUMP-02",
+  "issue_identified": "Severe pressure surge (215.0 PSI) with hydraulic cavitation and elevated vibration (7.4 mm/s)",
+  "severity": "HIGH",
+  "action_taken": "Hydraulic bypass opened on 'HYD-PUMP-02'. System pressure throttled down to nominal 82 PSI.",
+  "operational_status": "SAFE_MODE",
+  "estimated_delay_hours": 8.0,
+  "cost_impact_usd": 35000.0,
+  "location": "Rotterdam Bulk Logistics Terminal - Valve Bay 2"
+}

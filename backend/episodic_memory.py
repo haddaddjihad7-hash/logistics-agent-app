@@ -2,6 +2,11 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+# Speed optimization: prevent remote HuggingFace Hub network checks
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
@@ -14,6 +19,7 @@ COLLECTION_NAME = "episodic_memory"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 _cached_embedding_fn = None
+_cached_collection = None
 
 def get_embedding_function():
     global _cached_embedding_fn
@@ -32,6 +38,9 @@ def get_episodic_vector_store(
     Initializes a local persistent ChromaDB client and retrieves or creates
     the Episodic Memory collection with cosine distance metric.
     """
+    global _cached_collection
+    if _cached_collection is not None:
+        return _cached_collection
     db_path = str(persist_dir or CHROMA_PERSIST_DIR)
     os.makedirs(db_path, exist_ok=True)
 
@@ -47,8 +56,9 @@ def get_episodic_vector_store(
         metadata={"hnsw:space": "cosine", "description": "Episodic memory for historical logistics incidents and executions"},
         embedding_function=embedding_fn
     )
+    _cached_collection = collection
     logger.info(f"Initialized ChromaDB Episodic Vector Store at '{db_path}', collection: '{collection_name}' (count: {collection.count()})")
-    return collection
+    return _cached_collection
 
 
 def store_episodic_chunks(
