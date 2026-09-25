@@ -7,5 +7,8 @@ chromadb
 sentence-transformers
 kaggle
 pandas
+prometheus-client
+redis
+asyncpg
 langgraph>=0.2.0
 langchain-core>=0.3.0

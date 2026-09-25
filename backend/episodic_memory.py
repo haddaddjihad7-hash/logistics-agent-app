@@ -2,9 +2,12 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-# Speed optimization: prevent remote HuggingFace Hub network checks
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Speed optimization: prevent remote HuggingFace Hub network checks if model is cached
+if os.environ.get("ALLOW_ONLINE_HF", "0") != "1":
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    if cache_dir.exists() and any(cache_dir.glob("models--sentence-transformers--all-MiniLM-L6-v2*")):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import chromadb

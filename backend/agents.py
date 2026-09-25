@@ -2,8 +2,11 @@ import os
 import re
 import json
 import logging
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import TypedDict, Annotated, List, Dict, Any, Optional, Literal
+from typing import TypedDict, Annotated, List, Dict, Any, Optional, Literal, Callable
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -86,6 +89,9 @@ def invoke_gemini_brief(prompt: str, system_instruction: str) -> Optional[str]:
                 return response.text.strip()
         except Exception as e:
             logger.debug(f"Gemini call with {model_name} failed: {e}")
+            # Bound retries with exponential backoff so transient provider failures do not spin.
+            import time
+            time.sleep(min(2 ** (CANDIDATE_MODELS.index(model_name) + 1), 8))
             continue
     return None
 
@@ -376,6 +382,42 @@ class AgentState(TypedDict):
     logistics_data: dict
     execution_trace: list[dict] # records: timestamp, agent_name, thought, action, observation
     final_synthesis: dict
+    phase: str
+    approval_id: Optional[str]
+    state_events: list[dict]
+
+
+class AgentRegistry:
+    """Capability-based registry used by the supervisor instead of hardcoded routing."""
+
+    def __init__(self) -> None:
+        self._agents: dict[str, dict[str, Any]] = {}
+
+    def register(self, name: str, capabilities: set[str], handler: Callable[[AgentState], dict]) -> None:
+        self._agents[name] = {"capabilities": capabilities, "handler": handler}
+
+    def discover(self, state: AgentState) -> str:
+        """Return the first registered agent whose capabilities match the current phase."""
+        phase = state.get("phase", "diagnostic")
+        for name, entry in self._agents.items():
+            if phase in entry["capabilities"]:
+                return name
+        return END
+
+    def names(self) -> list[str]:
+        return list(self._agents)
+
+
+def append_state_event(state: AgentState, event_type: str, payload: dict[str, Any]) -> list[dict]:
+    """Create an append-only audit record without mutating the existing event list."""
+    events = list(state.get("state_events", []))
+    events.append({
+        "event_id": len(events) + 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "payload": payload,
+    })
+    return events
 
 # ==============================================================================
 # SPECIFICATION 1.3: FOUR SPECIALIZED AGENTS + ONE CENTRAL SUPERVISOR
@@ -410,16 +452,17 @@ def supervisor_node(state: AgentState) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     trace = list(state.get("execution_trace", []))
 
-    if not diag:
+    phase = state.get("phase", "diagnostic")
+    if phase == "diagnostic":
         next_agent = "DIAGNOSTIC SPECIALIST"
         thought = "Incoming industrial alert received. Routing alert to Diagnostic Specialist to query live PLC telemetry."
-    elif not comp:
+    elif phase == "safety":
         next_agent = "SAFETY AUDITOR"
         thought = f"Telemetry acquired for {diag.get('equipment_id', 'target unit')}. Routing to Safety Auditor for ISO-10816 standards check."
-    elif not mitig:
+    elif phase == "mitigation":
         next_agent = "MITIGATION OPERATOR"
         thought = f"Safety compliance evaluated ({comp.get('compliance_status', 'NON-COMPLIANT')}). Routing to Mitigation Operator for verified deterministic control dispatch."
-    elif not logist:
+    elif phase == "logistics":
         next_agent = "LOGISTICS IMPACT"
         thought = f"Mitigation executed ({mitig.get('action', 'action complete')}). Routing to Logistics Impact node to compute down-time, financial exposure, and supply-chain coordinates."
     else:
@@ -437,9 +480,15 @@ def supervisor_node(state: AgentState) -> dict:
         "observation": f"Assembly line dispatch confirmed -> {next_agent}"
     })
 
+    next_phase = {"DIAGNOSTIC SPECIALIST": "safety", "SAFETY AUDITOR": "mitigation", "MITIGATION OPERATOR": "logistics", "LOGISTICS IMPACT": "complete"}.get(next_agent, "complete")
     return {
         "active_agent": next_agent,
-        "execution_trace": trace
+        "phase": next_phase,
+        "execution_trace": trace,
+        "state_events": append_state_event(state, "supervisor_route", {
+            "target": next_agent,
+            "phase": next_phase,
+        }),
     }
 
 # ------------------------------------------------------------------------------
@@ -457,8 +506,18 @@ def diagnostic_node(state: AgentState) -> dict:
     equipment_id = extract_target_equipment(alert)
     raw_tool_args = {"equipment_id": equipment_id}
 
-    # Intercept with Pydantic guardrail
-    sensor_result = safe_get_sensor_data(raw_tool_args)
+    def retrieve_history() -> list[dict]:
+        store = get_store()
+        if store is None:
+            return []
+        return retrieve_episodic_context(query=alert, vector_store=store, k=3)
+
+    # These branches do not depend on each other and can safely share the diagnostic phase.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="diagnostic") as executor:
+        sensor_future = executor.submit(safe_get_sensor_data, raw_tool_args)
+        history_future = executor.submit(retrieve_history)
+        sensor_result = sensor_future.result()
+        historical_context = history_future.result()
 
     # Optional Gemini insight for rich diagnostics
     llm_thought = invoke_gemini_brief(
@@ -503,7 +562,8 @@ def diagnostic_node(state: AgentState) -> dict:
             "psi_delta": psi_delta,
             "primary_anomaly": primary_anomaly
         },
-        "diagnosed_issue": diagnosed_issue
+        "diagnosed_issue": diagnosed_issue,
+        "historical_context": historical_context,
     }
 
     trace.append({
@@ -521,7 +581,9 @@ def diagnostic_node(state: AgentState) -> dict:
     return {
         "diagnostic_data": diagnostic_payload,
         "execution_trace": trace,
-        "active_agent": "SAFETY AUDITOR"
+        "active_agent": "SAFETY AUDITOR",
+        "phase": "safety",
+        "state_events": append_state_event(state, "diagnostic_completed", diagnostic_payload),
     }
 
 # ------------------------------------------------------------------------------
@@ -534,8 +596,8 @@ def safety_auditor_node(state: AgentState) -> dict:
     and thermal trip conditions against live diagnostic data.
     """
     diag = state.get("diagnostic_data", {})
-    eq_id = diag.get("equipment_id", "EQUIPMENT-01")
-    telemetry = diag.get("telemetry", {})
+    eq_id = diag.get("equipment_id") or extract_target_equipment(state.get("alert_text", ""))
+    telemetry = diag.get("telemetry") or safe_get_sensor_data({"equipment_id": eq_id})
     now_iso = datetime.now(timezone.utc).isoformat()
     trace = list(state.get("execution_trace", []))
 
@@ -583,7 +645,8 @@ def safety_auditor_node(state: AgentState) -> dict:
         "iso_zone": iso_zone,
         "compliance_status": compliance_status,
         "mandatory_action": recommended_action,
-        "docs_data": docs_result
+        "docs_data": docs_result,
+        "confidence_score": 0.96 if not docs_result.get("error") else 0.65,
     }
 
     trace.append({
@@ -606,7 +669,12 @@ def safety_auditor_node(state: AgentState) -> dict:
     return {
         "compliance_data": compliance_payload,
         "execution_trace": trace,
-        "active_agent": "MITIGATION OPERATOR"
+        "active_agent": "MITIGATION OPERATOR",
+        "phase": "mitigation",
+        "state_events": append_state_event(state, "safety_audit_completed", {
+            "compliance_status": compliance_status,
+            "confidence_score": compliance_payload["confidence_score"],
+        }),
     }
 
 # ------------------------------------------------------------------------------
@@ -619,11 +687,37 @@ def mitigation_operator_node(state: AgentState) -> dict:
     """
     comp = state.get("compliance_data", {})
     diag = state.get("diagnostic_data", {})
-    eq_id = diag.get("equipment_id", "EQUIPMENT-01")
+    eq_id = diag.get("equipment_id") or extract_target_equipment(state.get("alert_text", ""))
     recommended_action = comp.get("mandatory_action", "lower_pressure")
+    confidence_score = float(comp.get("confidence_score", 0.0))
+    approval_threshold = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.80"))
 
     now_iso = datetime.now(timezone.utc).isoformat()
     trace = list(state.get("execution_trace", []))
+
+    if confidence_score < approval_threshold and not state.get("approval_id"):
+        trace.append({
+            "timestamp": now_iso,
+            "agent_name": "MITIGATION OPERATOR",
+            "thought": "Control dispatch paused because confidence is below the configured human approval threshold.",
+            "action": {"type": "HUMAN_APPROVAL_REQUIRED", "approval_id": None},
+            "observation": {"confidence_score": confidence_score, "threshold": approval_threshold},
+        })
+        return {
+            "mitigation_data": {
+                "approval_required": True,
+                "confidence_score": confidence_score,
+                "approval_threshold": approval_threshold,
+                "operational_status": "PENDING_APPROVAL",
+            },
+            "execution_trace": trace,
+            "active_agent": "HUMAN APPROVAL",
+            "phase": "complete",
+            "state_events": append_state_event(state, "approval_required", {
+                "confidence_score": confidence_score,
+                "threshold": approval_threshold,
+            }),
+        }
 
     raw_tool_args = {
         "equipment_id": eq_id,
@@ -669,7 +763,13 @@ def mitigation_operator_node(state: AgentState) -> dict:
     return {
         "mitigation_data": mitigation_payload,
         "execution_trace": trace,
-        "active_agent": "LOGISTICS IMPACT"
+        "active_agent": "LOGISTICS IMPACT",
+        "phase": "logistics",
+        "state_events": append_state_event(state, "control_action_completed", {
+            "equipment_id": eq_id,
+            "action": recommended_action,
+            "status": mitigation_payload["operational_status"],
+        }),
     }
 
 # ------------------------------------------------------------------------------
@@ -787,7 +887,9 @@ def logistics_impact_node(state: AgentState) -> dict:
         "logistics_data": logistics_payload,
         "final_synthesis": final_synthesis,
         "execution_trace": trace,
-        "active_agent": "FINISH"
+        "active_agent": "FINISH",
+        "phase": "complete",
+        "state_events": append_state_event(state, "logistics_synthesis_completed", final_synthesis),
     }
 
 # ==============================================================================
@@ -795,16 +897,16 @@ def logistics_impact_node(state: AgentState) -> dict:
 # ==============================================================================
 
 def route_supervisor(state: AgentState) -> str:
-    """Conditional router function for the supervisor node."""
-    if not state.get("diagnostic_data"):
-        return "diagnostic"
-    if not state.get("compliance_data"):
-        return "safety_auditor"
-    if not state.get("mitigation_data"):
-        return "mitigation_operator"
-    if not state.get("logistics_data"):
-        return "logistics_impact"
-    return END
+    """Discover the next agent from registered capabilities and explicit phase state."""
+    if state.get("mitigation_data", {}).get("approval_required"):
+        return END
+    discovered = agent_registry.discover(state)
+    return {
+        "DIAGNOSTIC SPECIALIST": "diagnostic",
+        "SAFETY AUDITOR": "safety_auditor",
+        "MITIGATION OPERATOR": "mitigation_operator",
+        "LOGISTICS IMPACT": "logistics_impact",
+    }.get(discovered, END)
 
 workflow = StateGraph(AgentState)
 
@@ -838,18 +940,67 @@ workflow.add_edge("logistics_impact", "supervisor")
 # Compile graph
 app_graph = workflow.compile()
 
-def run_multi_agent_workflow(alert_text: str) -> AgentState:
+agent_registry = AgentRegistry()
+agent_registry.register("DIAGNOSTIC SPECIALIST", {"diagnostic"}, diagnostic_node)
+agent_registry.register("SAFETY AUDITOR", {"safety"}, safety_auditor_node)
+agent_registry.register("MITIGATION OPERATOR", {"mitigation"}, mitigation_operator_node)
+agent_registry.register("LOGISTICS IMPACT", {"logistics"}, logistics_impact_node)
+
+def create_initial_state(alert_text: str, approval_id: Optional[str] = None) -> AgentState:
     """Invokes the compiled multi-agent LangGraph workflow."""
     initial_state: AgentState = {
-        "messages": [],
-        "alert_text": alert_text,
-        "active_agent": "CENTRAL SUPERVISOR",
+           "messages": [],
+           "alert_text": alert_text,
+           "active_agent": "CENTRAL SUPERVISOR",
         "diagnostic_data": {},
         "compliance_data": {},
         "mitigation_data": {},
         "logistics_data": {},
         "execution_trace": [],
-        "final_synthesis": {}
+        "final_synthesis": {},
+        "phase": "diagnostic",
+        "approval_id": approval_id,
+        "state_events": [{
+            "event_id": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": "workflow_started",
+            "payload": {"alert_text": alert_text},
+        }],
     }
-    final_state = app_graph.invoke(initial_state)
-    return final_state
+    return initial_state
+
+
+def run_multi_agent_workflow(alert_text: str, approval_id: Optional[str] = None) -> AgentState:
+    """Invokes the compiled LangGraph multi-agent workflow."""
+    return app_graph.invoke(create_initial_state(alert_text, approval_id))
+
+
+async def run_multi_agent_workflow_async(alert_text: str, approval_id: Optional[str] = None) -> AgentState:
+    """Run the blocking LangGraph/Gemini integration without blocking the event loop."""
+    return await asyncio.to_thread(run_multi_agent_workflow, alert_text, approval_id)
+
+
+async def stream_multi_agent_workflow(alert_text: str, approval_id: Optional[str] = None):
+    """Yield LangGraph node updates while the blocking graph runs in a worker thread."""
+    loop = asyncio.get_running_loop()
+    updates: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    def produce() -> None:
+        try:
+            for update in app_graph.stream(
+                create_initial_state(alert_text, approval_id),
+                stream_mode="updates",
+            ):
+                loop.call_soon_threadsafe(updates.put_nowait, ("update", update))
+            loop.call_soon_threadsafe(updates.put_nowait, ("done", None))
+        except Exception as error:
+            loop.call_soon_threadsafe(updates.put_nowait, ("error", error))
+
+    threading.Thread(target=produce, name="agent-stream", daemon=True).start()
+    while True:
+        kind, payload = await updates.get()
+        if kind == "done":
+            return
+        if kind == "error":
+            raise payload
+        yield payload

@@ -1,0 +1,19 @@
+services:
+  ingress:
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.tls.conf:/etc/nginx/nginx.conf:ro
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+
+  backend:
+    ports: []
+
+  frontend:
+    ports: []
+    environment:
+      - NEXT_PUBLIC_API_URL=
+
+  grafana:
+    ports: []

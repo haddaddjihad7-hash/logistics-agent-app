@@ -2,16 +2,25 @@
 
 import React, { useState } from "react";
 
+type JsonRecord = Record<string, unknown>;
+
+interface ActionDetails {
+  tool?: string;
+  type?: string;
+  arguments?: JsonRecord;
+  guardrail_status?: string;
+}
+
 interface ToolCall {
   name: string;
-  arguments: Record<string, any>;
+  arguments: JsonRecord;
 }
 
 interface ReActStep {
   turn: number;
   thought: string;
   tool_call?: ToolCall | null;
-  observation?: any;
+  observation?: unknown;
   status?: string;
 }
 
@@ -19,9 +28,9 @@ interface ExecutionTraceStep {
   timestamp?: string;
   agent_name: string;
   thought: string;
-  action?: any;
-  arguments?: Record<string, any>;
-  observation?: any;
+  action?: ActionDetails | null;
+  arguments?: JsonRecord;
+  observation?: unknown;
   status?: string;
 }
 
@@ -66,10 +75,10 @@ interface DiagnoseResponse {
   diagnosis: FinalDiagnosis;
   final_synthesis?: FinalSynthesis;
   agent_handoffs?: AgentHandoff[];
-  logistics?: Record<string, any>;
-  diagnostic_data?: Record<string, any>;
-  compliance_data?: Record<string, any>;
-  mitigation_data?: Record<string, any>;
+  logistics?: JsonRecord;
+  diagnostic_data?: JsonRecord;
+  compliance_data?: JsonRecord;
+  mitigation_data?: JsonRecord;
 }
 
 const TEST_SCENARIOS = [
@@ -108,11 +117,13 @@ export default function Home() {
   const [result, setResult] = useState<DiagnoseResponse | null>(null);
   const [error, setError] = useState("");
   const [terminalExpanded, setTerminalExpanded] = useState(true);
+  const [liveEvents, setLiveEvents] = useState<string[]>([]);
 
   const handleDiagnose = async () => {
     if (!text.trim()) return;
     setLoading(true);
     setError("");
+    setLiveEvents([]);
     setActiveSwarmStep(0);
 
     // Dynamic Swarm step simulation while awaiting backend response
@@ -121,12 +132,47 @@ export default function Home() {
     }, 2800);
 
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || (
+        typeof window !== "undefined" && window.location.port === "3000"
+          ? "http://127.0.0.1:8000"
+          : ""
+      );
+      const streamResponse = await fetch(`${apiBase}/api/stream`);
+      if (streamResponse.body) {
+        const reader = streamResponse.body.getReader();
+        const decoder = new TextDecoder();
+        void (async () => {
+          let buffer = "";
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split("\n\n");
+            buffer = events.pop() || "";
+            events.forEach((event) => {
+              const line = event.split("\n").find((entry) => entry.startsWith("data: "));
+              if (line) {
+                try {
+                  const payload = JSON.parse(line.slice(6)) as JsonRecord;
+                  const message = typeof payload.message === "string" ? payload.message : String(payload.event || "event");
+                  setLiveEvents((current) => [...current.slice(-7), message]);
+                } catch {
+                  // Ignore incomplete SSE frames.
+                }
+              }
+            });
+          }
+        })();
+      }
+      const reqHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (process.env.NEXT_PUBLIC_API_KEY) {
+        reqHeaders["x-api-key"] = process.env.NEXT_PUBLIC_API_KEY;
+      }
       const response = await fetch(`${apiBase}/api/diagnose`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: reqHeaders,
         body: JSON.stringify({ text }),
       });
 
@@ -138,13 +184,14 @@ export default function Home() {
       const data: DiagnoseResponse = await response.json();
       setResult(data);
       setActiveSwarmStep(5); // all completed
-    } catch (err: any) {
-      if (err?.message?.includes("Failed to fetch") || err?.name === "TypeError") {
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "An unexpected error occurred during multi-agent diagnosis.";
+      if (message.includes("Failed to fetch")) {
         setError(
-          "Could not connect to the AI backend server at http://127.0.0.1:8000. Please ensure the FastAPI server is running."
+          "Could not connect to the AI backend server. Please ensure the FastAPI server is running."
         );
       } else {
-        setError(err.message || "An unexpected error occurred during multi-agent diagnosis.");
+        setError(message);
       }
     } finally {
       clearInterval(swarmInterval);
@@ -209,7 +256,7 @@ export default function Home() {
     return { bg: "rgba(99, 102, 241, 0.15)", text: "#a5b4fc", border: "rgba(99, 102, 241, 0.4)", icon: "🧭" };
   };
 
-  const formatObservation = (obs: any) => {
+  const formatObservation = (obs: unknown) => {
     if (obs === null || obs === undefined) return "None";
     if (typeof obs === "string") return obs;
     return JSON.stringify(obs, null, 2);
@@ -219,13 +266,13 @@ export default function Home() {
   const displayTrace: ExecutionTraceStep[] = result?.execution_trace && result.execution_trace.length > 0
     ? result.execution_trace
     : (result?.trace || []).map((t) => ({
-        timestamp: new Date().toISOString(),
-        agent_name: t.thought.includes("[") ? t.thought.split("]")[0].replace("[", "") : "ReAct Operator",
-        thought: t.thought.includes("]") ? t.thought.split("]").slice(1).join("]").trim() : t.thought,
-        action: t.tool_call ? { tool: t.tool_call.name, arguments: t.tool_call.arguments } : null,
-        observation: t.observation,
-        status: t.status
-      }));
+      timestamp: new Date().toISOString(),
+      agent_name: t.thought.includes("[") ? t.thought.split("]")[0].replace("[", "") : "ReAct Operator",
+      thought: t.thought.includes("]") ? t.thought.split("]").slice(1).join("]").trim() : t.thought,
+      action: t.tool_call ? { tool: t.tool_call.name, arguments: t.tool_call.arguments } : null,
+      observation: t.observation,
+      status: t.status
+    }));
 
   return (
     <main className="app-container" style={{ maxWidth: "1280px", padding: "30px 20px" }}>
@@ -248,8 +295,6 @@ export default function Home() {
         {SWARM_AGENTS.map((agent, idx) => {
           const isCompleted = result ? true : activeSwarmStep > idx;
           const isActive = loading && activeSwarmStep === idx;
-          const isIdle = !result && !loading;
-
           return (
             <div
               key={agent.id}
@@ -492,6 +537,11 @@ export default function Home() {
               <p style={{ color: "#94a3b8", fontSize: "0.85rem", maxWidth: "400px", margin: "0 auto" }}>
                 Executing deterministic tool guardrails • Querying ChromaDB episodic memory • Disagreeing & synthesizing safe state
               </p>
+              {liveEvents.length > 0 && (
+                <div style={{ margin: "18px auto 0", maxWidth: "520px", textAlign: "left", color: "#67e8f9", fontFamily: "JetBrains Mono, monospace", fontSize: "0.72rem" }}>
+                  {liveEvents.map((event, index) => <div key={`${event}-${index}`}>› {event}</div>)}
+                </div>
+              )}
             </div>
           )}
 
@@ -546,7 +596,7 @@ export default function Home() {
 
                         {/* Thought */}
                         <div style={{ fontSize: "0.85rem", color: "#f1f5f9", lineHeight: "1.45", marginBottom: step.action ? "8px" : "0" }}>
-                          {step.thought}
+                          {String(step.thought)}
                         </div>
 
                         {/* Action Tool Pill */}
@@ -555,7 +605,7 @@ export default function Home() {
                             <div style={{ display: "inline-flex", alignItems: "center", gap: "6px", background: "rgba(2, 6, 23, 0.7)", border: "1px solid rgba(255, 255, 255, 0.1)", borderRadius: "6px", padding: "3px 8px", fontSize: "0.75rem", fontFamily: "JetBrains Mono, monospace", color: "#38bdf8" }}>
                               <span>⚡</span>
                               <span>
-                                {typeof step.action === "string" ? step.action : step.action.tool || step.action.type || "Action"}
+                                {step.action.tool || step.action.type || "Action"}
                               </span>
                               {step.action.arguments && (
                                 <span style={{ color: "#94a3b8" }}>
@@ -610,7 +660,7 @@ export default function Home() {
                             [PYDANTIC GUARD] {step.action.guardrail_status}
                           </div>
                         )}
-                        {step.observation && (
+                        {step.observation !== undefined && step.observation !== null && (
                           <pre className="observation-box" style={{ fontSize: "0.72rem", padding: "6px 8px" }}>
                             {formatObservation(step.observation)}
                           </pre>
